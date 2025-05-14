@@ -3,7 +3,7 @@ items_per_page = 100  # The number of results in each page of the GitHub results
 tokens_file = "../Resources/tokens.txt"  # The relative path of the file containing the list of the github tokens
 
 ### Extraction Settings
-data_collection_date = "2024-05-10"  # The max date to consider for the commits and activities extraction
+data_collection_date = "2025-01-01"  # The max date to consider for the commits and activities extraction
 repos_file = "Resources/repositories.txt"  # The relative path of the file containing the list of the repos <organization/repo>
 main_folder = "../Organizations"  # The main folder where results will be archived
 logs_folder = "../logs"  # The folder where the logs will be archived
@@ -33,11 +33,11 @@ issue_comments_list_file_name = "issues_comments_repo.csv"  # The file where the
 pulls_comments_list_file_name = "pulls_comments_repo.csv"  # The file where the repo pulls comments will be archived
 issue_events_list_file_name = "issues_events_repo.csv"  # The file where the repo issue events will be archived
 issue_pr_list_file_name = "issues_prs_repo.csv"  # The file where the repo issue/PRs creations will be archived
-
+PR_list_file_name= "prs_repo.csv" # The file where the repo PRs will be archived
 #core_commit_coverage = 0.8 #Percentage of commits to cover for the core identification
 
 ### Files Settings
-CSV_separator = ";"  # Character for cell separation in the used files
+CSV_separator = ","  # Character for cell separation in the used files
 CSV_missing = "NA"  # Character for the missing values in the used files
 
 ### Breaks Identification

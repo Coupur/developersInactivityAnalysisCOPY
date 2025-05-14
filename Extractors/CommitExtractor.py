@@ -6,7 +6,9 @@ from github.GithubException import IncompletableObject
 ### IMPORT SYSTEM MODULES
 from github import Github
 import os, logging, pandas, csv
-from datetime import datetime
+from datetime import datetime, timezone
+from tqdm import tqdm
+
 
 ### IMPORT CUSTOM MODULES
 import sys
@@ -63,137 +65,179 @@ def runCommitExtractionRoutine(g, token, organizationFolder, organization, proje
 def updateCommitListFile(g, token, repoName, start_date, end_date, workingFolder):
     """Writes the list of the commits fro the given repository"""
 
-    outputFileName = cfg.commit_list_file_name
-    tmpSavefile = "_saveFile.tmp"
-    tmpExcludedCommits = "_excludedNoneType.tmp"
-    tmpStatusFile = "_extractionStatus.tmp"
-    logging.info("Initializing Extraction")
+    commits_csv = cfg.commit_list_file_name
+    prs_csv     = cfg.PR_list_file_name
+    save_tmp    = "_saveFile.tmp"
+    excl_tmp    = "_excludedNoneType.tmp"
+    status_tmp  = "_extractionStatus.tmp"
 
-    status = getCommitExtractionStatus(workingFolder, tmpStatusFile)
-    if(status != COMPLETE):
-        with open(os.path.join(workingFolder, tmpStatusFile), "w") as statusSaver:
-            statusSaver.write('INCOMPLETE;{}'.format(datetime.today().strftime('%Y-%m-%d %H:%M:%S')))
+    status = getCommitExtractionStatus(workingFolder, status_tmp)
+    if status == COMPLETE:                     # already done
+        return g, token
 
-        exception_thrown = True
-        while (exception_thrown):
-            exception_thrown = False
+    os.makedirs(workingFolder, exist_ok=True)
+    with open(os.path.join(workingFolder, status_tmp), "w") as fh:
+        fh.write(f"INCOMPLETE;{datetime.today():%Y-%m-%d %H:%M:%S}")
 
+    # ---------- prepare DataFrames ----------
+    commit_cols = [
+        "sha", "PR_id", "author_id", "committer_id", "date",
+        "filename_list", "fileschanged_count", "additions_sum", "deletions_sum"
+    ]
+    pr_cols = [
+        "PR_id", "author_id", "state", "merged",
+        "created_at", "closed_at", "merged_at",
+        "sha_list", "filename_list",
+        "fileschanged_count", "additions_sum", "deletions_sum"
+    ]
+
+    commits_df = (pandas.read_csv(os.path.join(workingFolder, commits_csv), sep=cfg.CSV_separator)
+                  if commits_csv in os.listdir(workingFolder)
+                  else pandas.DataFrame(columns=commit_cols))
+
+    prs_df = (pandas.read_csv(os.path.join(workingFolder, prs_csv), sep=cfg.CSV_separator)
+              if prs_csv in os.listdir(workingFolder)
+              else pandas.DataFrame(columns=pr_cols))
+
+    excluded = (pandas.read_csv(os.path.join(workingFolder, excl_tmp), sep=cfg.CSV_separator)
+                if excl_tmp in os.listdir(workingFolder)
+                else pandas.DataFrame(columns=["sha"]))
+
+    # ---------- GitHub handles ----------
+    g, token = util.waitRateLimit(g, token)
+    repo     = g.get_repo(repoName)
+
+    # commits total-count (for page math)
+    commits   = repo.get_commits(since=start_date, until=end_date)
+    last_page = int(commits.totalCount / cfg.items_per_page)
+    start_page = util.getLastPageRead(os.path.join(workingFolder, save_tmp)) if save_tmp in os.listdir(workingFolder) else 0
+    total_pages = last_page - start_page + 1
+
+    pbar = tqdm(total=total_pages, desc="Downloading", unit="page")
+
+    try:
+        for page in range(start_page, last_page + 1):
+            # ――― rate-limit & progress ―――
+            pbar.update(1)
+            pbar.set_postfix({
+                "core_left": g.get_rate_limit().core.remaining,
+                "repo": repoName.split('/')[-1],
+                "page": f"{page}/{last_page}"
+            })
             g, token = util.waitRateLimit(g, token)
-            repo = g.get_repo(repoName)
 
-            commits = repo.get_commits(since=start_date, until=end_date)  # Fake users to be filtered out (author_id NOT IN (SELECT id from users where fake=1))
+            start_date = _ensure_utc(start_date)
+            end_date   = _ensure_utc(end_date)
 
-            count_exception = True
-            while (count_exception):
-                count_exception = False
-                try:
-                    num_items = commits.totalCount
-                except GithubException as ghe:
-                    if str(ghe).startswith('500'):  # former == '500 None':
-                        logging.warning('Failed to get commits from this project (500 None: Ignoring Repo): {}'.format(repoName))
-                        return
-                    elif str(ghe).startswith('409'):
-                        logging.warning('Failed to get commits from this project (409 Empty: Ignoring Repo):'.format(repoName))
-                        return
-                    else:
-                        logging.warning('Failed to get commits from this project (GITHUB Unknown: Retrying):'.format(repoName))
-                        count_exception = True
-                    pass
-                except Timeout:
-                    logging.warning('Failed to get commits from this project (TIMEOUT: Retrying):'.format(repoName))
-                    count_exception = True
-                    pass
-                except:
-                    logging.warning('Failed to get commits from this project (Probably Empty): '.format(repoName))
-                    return
+            # Pull-requests for this page (GitHub paginates newest-first)
+            pulls_page = repo.get_pulls(state="all", sort="created", direction="desc").get_page(page)
 
-            last_page = int(num_items / cfg.items_per_page)
-            last_page_read = 0
+            # ---------------------------------------- PR loop ----------------------------------------
+            for pr in pulls_page:
+                g, token = util.waitRateLimit(g, token)
 
-            if (outputFileName in os.listdir(workingFolder)):
-                commits_data = pandas.read_csv(os.path.join(workingFolder, outputFileName), sep=cfg.CSV_separator)
-                if (tmpSavefile in os.listdir(workingFolder)):
-                    last_page_read = util.getLastPageRead(os.path.join(workingFolder, tmpSavefile))
-                logging.info("Resuming Extraction")
-            else:
-                commits_data = pandas.DataFrame(columns=['sha', 'author_id', 'date'])
-                logging.info("Starting New Extraction")
+                pr_id       = pr.number
+                pr_author   = pr.user.login if pr.user else None
+                pr_state    = pr.state
+                pr_merged   = bool(pr.merged)
+                pr_created  = pr.created_at
+                pr_closed   = pr.closed_at
+                pr_mergedat = pr.merged_at
 
-            if tmpExcludedCommits in os.listdir(workingFolder):
-                excluded_commits = pandas.read_csv(os.path.join(workingFolder, tmpExcludedCommits), sep=cfg.CSV_separator)
-            else:
-                excluded_commits = pandas.DataFrame(columns=['sha'])
+                sha_list, filename_set = [], set()
+                add_sum = del_sum = 0
 
-                try:
-                    for page in range(last_page_read, last_page + 1):
-                        commits_page = commits.get_page(page)
-                        for commit in commits_page:
-                            g, token = util.waitRateLimit(g, token)
-                            sha = commit.sha
-                            if ((sha not in commits_data.sha.tolist()) and (sha not in excluded_commits.sha.tolist())):
-                                if (
-                                commit.author):  ### If author is NoneType, that means the author is no longer active in GitHub
-                                    g, token = util.waitRateLimit(g, token)
-                                    author_id = commit.author.login  ### HERE IS THE DIFFERENCE
-                                    date = commit.commit.author.date
-                                    util.add(commits_data, [sha, author_id, date])
-                    if (len(commits_data) > 0):
-                        commits_data.to_csv(os.path.join(workingFolder, outputFileName),
-                                            sep=cfg.CSV_separator, na_rep=cfg.CSV_missing, index=False, quoting=None, lineterminator='\n')
-                except IncompletableObject:
-                    logging.warning('Github Exception 400: Returned object contains no URL. SHA: {}'.format(sha))
-                    util.add(excluded_commits, [sha])
-                    if (len(commits_data) > 0):
-                        commits_data.to_csv(os.path.join(workingFolder, outputFileName),
-                                            sep=cfg.CSV_separator, na_rep=cfg.CSV_missing, index=False, quoting=None, lineterminator='\n')
-                    excluded_commits.to_csv(os.path.join(workingFolder, tmpExcludedCommits),
-                                            sep=cfg.CSV_separator, na_rep=cfg.CSV_missing, index=False, quoting=None, lineterminator='\n')
-                    with open(os.path.join(workingFolder, tmpSavefile), "w") as statusSaver:
-                        statusSaver.write('last_page:{}'.format(page))
-                    exception_thrown = True
-                    pass
-                except GithubException as ghe:
-                    logging.warning('Exception Occurred While Getting COMMITS: Github {}'.format(ghe))
-                    if (len(commits_data) > 0):
-                        commits_data.to_csv(os.path.join(workingFolder, outputFileName),
-                                            sep=cfg.CSV_separator, na_rep=cfg.CSV_missing, index=False, quoting=None, lineterminator='\n')
-                    with open(os.path.join(workingFolder, tmpSavefile), "w") as statusSaver:
-                        statusSaver.write('last_page:{}'.format(page))
-                    exception_thrown = True
-                    pass
-                except Timeout:
-                    logging.warning('Exception Occurred While Getting COMMITS: Timeout')
-                    if (len(commits_data) > 0):
-                        commits_data.to_csv(os.path.join(workingFolder, outputFileName),
-                                            sep=cfg.CSV_separator, na_rep=cfg.CSV_missing, index=False, quoting=None, lineterminator='\n')
-                    with open(os.path.join(workingFolder, tmpSavefile), "w") as statusSaver:
-                        statusSaver.write('last_page:{}'.format(page))
-                    exception_thrown = True
-                    pass
-                except AttributeError:
-                    logging.warning('Exception Occurred While Getting COMMIT DATA: NoneType for Author. SHA: {}'.format(sha))
-                    util.add(excluded_commits, [sha])
-                    if (len(commits_data) > 0):
-                        commits_data.to_csv(os.path.join(workingFolder, outputFileName),
-                                            sep=cfg.CSV_separator, na_rep=cfg.CSV_missing, index=False, quoting=None, lineterminator='\n')
-                    excluded_commits.to_csv(os.path.join(workingFolder, tmpExcludedCommits),
-                                            sep=cfg.CSV_separator, na_rep=cfg.CSV_missing, index=False, quoting=None, lineterminator='\n')
-                    with open(os.path.join(workingFolder, tmpSavefile), "w") as statusSaver:
-                        statusSaver.write('last_page:{}'.format(page))
-                    exception_thrown = True
-                    pass
-                except:
-                    logging.warning('Execution Interrupted While Getting COMMITS')
-                    if (len(commits_data) > 0):
-                        commits_data.to_csv(os.path.join(workingFolder, outputFileName),
-                                            sep=cfg.CSV_separator, na_rep=cfg.CSV_missing, index=False, quoting=None, lineterminator='\n')
-                    with open(os.path.join(workingFolder, tmpSavefile), "w") as statusSaver:
-                        statusSaver.write('last_page:{}'.format(page))
-                    raise
-        logging.info("Commit Extraction Complete")
-        with open(os.path.join(workingFolder, tmpStatusFile), "w") as statusSaver:
-            statusSaver.write('COMPLETE;{}'.format(cfg.data_collection_date))
+                # -------- Commit loop inside one PR --------
+                for pr_commit in pr.get_commits():
+                    g, token = util.waitRateLimit(g, token)
+                    sha = pr_commit.sha
+
+                    # skip processed / ghost commits
+                    if sha in commits_df.sha.values or sha in excluded.sha.values:
+                        continue
+                    if pr_commit.author is None:
+                        util.add(excluded, [sha])
+                        continue
+
+                    author_id    = pr_commit.author.login
+                    committer_id = pr_commit.commit.committer.name
+                    date         = pr_commit.commit.author.date
+
+                    detailed = repo.get_commit(sha)
+                    files    = detailed.files
+                    filenames = [f.filename for f in files]
+                    fchg_cnt = len(filenames)
+                    adds      = sum(f.additions for f in files)
+                    dels      = sum(f.deletions for f in files)
+
+                    sha_list.extend([sha])
+                    filename_set.update(filenames)
+                    add_sum += adds
+                    del_sum += dels
+
+                    util.add(
+                        commits_df,
+                        [sha, pr_id, author_id, committer_id, date,
+                         "|".join(filenames), fchg_cnt, adds, dels]
+                    )
+                    util.add(excluded, [sha])
+
+                # finished one PR row
+
+                util.add(
+                    prs_df,
+                    [pr_id, pr_author, pr_state, pr_merged,
+                     pr_created, pr_closed, pr_mergedat,
+                     "|".join(sha_list),
+                     "|".join(sorted(filename_set)),
+                     len(filename_set), add_sum, del_sum]
+                )
+
+        # ----------------------------- end-for page -----------------------------
+    except KeyboardInterrupt:         # user hit Ctrl-C
+        logging.warning("Interrupted by user – flushing partial data")
+        
+        commits_df.to_csv(os.path.join(workingFolder, commits_csv),
+                          sep=cfg.CSV_separator, index=False, lineterminator="\n")
+        prs_df.to_csv(os.path.join(workingFolder, prs_csv),
+                      sep=cfg.CSV_separator, index=False, lineterminator="\n")
+        excluded.to_csv(os.path.join(workingFolder, excl_tmp),
+                        sep=cfg.CSV_separator, index=False, lineterminator="\n")
+        
+        with open(os.path.join(workingFolder, save_tmp), "w") as fh:
+            fh.write(f"last_page:{page}")
+        raise
+    
+    except Exception as e:
+        logging.warning(f"Extraction interrupted: {e}") # flush everything we have so far
+        commits_df.to_csv(os.path.join(workingFolder, commits_csv),
+                          sep=cfg.CSV_separator, index=False, lineterminator="\n")
+        prs_df.to_csv(os.path.join(workingFolder, prs_csv),
+                      sep=cfg.CSV_separator, index=False, lineterminator="\n")
+        excluded.to_csv(os.path.join(workingFolder, excl_tmp),
+                        sep=cfg.CSV_separator, index=False, lineterminator="\n")
+        with open(os.path.join(workingFolder, save_tmp), "w") as fh:
+            fh.write(f"last_page:{page}")
+        raise                       # propagate so caller can see it
+
+    finally:
+        pbar.close()
+
+    # ---------- final flush & COMPLETE ----------
+    commits_df.to_csv(os.path.join(workingFolder, commits_csv),
+                      sep=cfg.CSV_separator, index=False, lineterminator="\n")
+    prs_df.to_csv(os.path.join(workingFolder, prs_csv),
+                  sep=cfg.CSV_separator, index=False, lineterminator="\n")
+    if len(excluded):
+        excluded.to_csv(os.path.join(workingFolder, excl_tmp),
+                        sep=cfg.CSV_separator, index=False, lineterminator="\n")
+
+    with open(os.path.join(workingFolder, status_tmp), "w") as fh:
+        fh.write(f"COMPLETE;{cfg.data_collection_date}")
+
+    logging.info("Commit + PR extraction COMPLETE for %s", repoName)
     return g, token
+
 
 def writeCommitHistoryTable(workingFolder, commits_data):
     """Writes the commit history in form of a table of days x developers. Each cell contains the number of commits"""
@@ -294,6 +338,16 @@ def mergeProjectsCommits(path, main_project_name):  # No filter on core_devs_df.
     commits_data.to_csv(os.path.join(path, cfg.commit_list_file_name),
                         sep=cfg.CSV_separator, na_rep=cfg.CSV_missing, index=False, quoting=None, lineterminator='\n')
     logging.info('All the Organization commits have been merged with '.format(main_project_name))
+
+def _ensure_utc(dt):
+    """
+    Return the same datetime as an *offset-aware* object in UTC.
+    Safe to call on values that are already aware.
+    """
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
 
 ### MAIN FUNCTION
 def main(gitRepoName, token):

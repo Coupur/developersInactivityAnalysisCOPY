@@ -102,7 +102,7 @@ def getRandomToken(last_token=None):
 
 def add(dataframe, row):
     """Adds a row to the tail of a dataframe"""
-    dataframe.loc[-1] = row  # adding a row
+    dataframe.loc[len(dataframe)] = row  # adding a row
     dataframe.index = dataframe.index + 1  # shifting index
     dataframe.sort_index(inplace=True)
     dataframe.iloc[::-1]
