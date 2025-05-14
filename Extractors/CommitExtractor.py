@@ -67,6 +67,9 @@ def updateCommitListFile(g, token, repoName, start_date, end_date, workingFolder
 
     commits_csv = cfg.commit_list_file_name
     prs_csv     = cfg.PR_list_file_name
+    prs_comments_csv = cfg.prs_comments_csv
+    prs_reviews_csv = cfg.prs_reviews_csv
+
     save_tmp    = "_saveFile.tmp"
     excl_tmp    = "_excludedNoneType.tmp"
     status_tmp  = "_extractionStatus.tmp"
@@ -79,7 +82,6 @@ def updateCommitListFile(g, token, repoName, start_date, end_date, workingFolder
     with open(os.path.join(workingFolder, status_tmp), "w") as fh:
         fh.write(f"INCOMPLETE;{datetime.today():%Y-%m-%d %H:%M:%S}")
 
-    # ---------- prepare DataFrames ----------
     commit_cols = [
         "sha", "PR_id", "author_id", "committer_id", "date",
         "filename_list", "fileschanged_count", "additions_sum", "deletions_sum"
@@ -91,6 +93,14 @@ def updateCommitListFile(g, token, repoName, start_date, end_date, workingFolder
         "fileschanged_count", "additions_sum", "deletions_sum"
     ]
 
+    pr_comments = [
+        "PR_id", "comment_id", "review_id", "user_id", "created_at", "body" ]
+    
+    pr_reviews = [
+        "PR_id", "review_id", "user_id", "created_at", "body", ]
+
+
+
     commits_df = (pandas.read_csv(os.path.join(workingFolder, commits_csv), sep=cfg.CSV_separator)
                   if commits_csv in os.listdir(workingFolder)
                   else pandas.DataFrame(columns=commit_cols))
@@ -98,12 +108,19 @@ def updateCommitListFile(g, token, repoName, start_date, end_date, workingFolder
     prs_df = (pandas.read_csv(os.path.join(workingFolder, prs_csv), sep=cfg.CSV_separator)
               if prs_csv in os.listdir(workingFolder)
               else pandas.DataFrame(columns=pr_cols))
+    
+    prs_comments_df = (pandas.read_csv(os.path.join(workingFolder, prs_comments_csv), sep=cfg.CSV_separator)
+                        if prs_comments_csv in os.listdir(workingFolder)
+                        else pandas.DataFrame(columns=pr_comments))
+    
+    prs_reviews_df = (pandas.read_csv(os.path.join(workingFolder, prs_reviews_csv), sep=cfg.CSV_separator)
+                        if prs_reviews_csv in os.listdir(workingFolder)
+                        else pandas.DataFrame(columns=pr_reviews))
 
     excluded = (pandas.read_csv(os.path.join(workingFolder, excl_tmp), sep=cfg.CSV_separator)
                 if excl_tmp in os.listdir(workingFolder)
                 else pandas.DataFrame(columns=["sha"]))
 
-    # ---------- GitHub handles ----------
     g, token = util.waitRateLimit(g, token)
     repo     = g.get_repo(repoName)
 
@@ -117,7 +134,7 @@ def updateCommitListFile(g, token, repoName, start_date, end_date, workingFolder
 
     try:
         for page in range(start_page, last_page + 1):
-            # ――― rate-limit & progress ―――
+            
             pbar.update(1)
             pbar.set_postfix({
                 "core_left": g.get_rate_limit().core.remaining,
@@ -132,7 +149,6 @@ def updateCommitListFile(g, token, repoName, start_date, end_date, workingFolder
             # Pull-requests for this page (GitHub paginates newest-first)
             pulls_page = repo.get_pulls(state="all", sort="created", direction="desc").get_page(page)
 
-            # ---------------------------------------- PR loop ----------------------------------------
             for pr in pulls_page:
                 g, token = util.waitRateLimit(g, token)
 
@@ -147,7 +163,6 @@ def updateCommitListFile(g, token, repoName, start_date, end_date, workingFolder
                 sha_list, filename_set = [], set()
                 add_sum = del_sum = 0
 
-                # -------- Commit loop inside one PR --------
                 for pr_commit in pr.get_commits():
                     g, token = util.waitRateLimit(g, token)
                     sha = pr_commit.sha
@@ -182,6 +197,31 @@ def updateCommitListFile(g, token, repoName, start_date, end_date, workingFolder
                     )
                     util.add(excluded, [sha])
 
+                    for cmt in pr.get_comments():
+                        util.add(
+                            prs_comments_df,
+                            [
+                                pr_id,                           # PR_id FK
+                                cmt.id,                          # comment_id
+                                cmt.pull_request_review_id,      # review_id FK (may be None)
+                                cmt.user.login if cmt.user else None,
+                                cmt.created_at,
+                                (cmt.body or "").replace("\n", " ")
+                            ]
+                        )
+                    
+                    for rvw in pr.get_reviews():
+                        util.add(
+                            prs_reviews_df,
+                            [
+                                pr_id,                   # PR_id FK
+                                rvw.id,                  # review_id
+                                rvw.user.login if rvw.user else None,
+                                rvw.submitted_at,
+                                (rvw.body or "").replace("\n", " ")  # preview text
+                            ]
+                        )
+
                 # finished one PR row
 
                 util.add(
@@ -193,14 +233,17 @@ def updateCommitListFile(g, token, repoName, start_date, end_date, workingFolder
                      len(filename_set), add_sum, del_sum]
                 )
 
-        # ----------------------------- end-for page -----------------------------
-    except KeyboardInterrupt:         # user hit Ctrl-C
-        logging.warning("Interrupted by user – flushing partial data")
+    except KeyboardInterrupt:         # Ctrl-C
+        logging.warning("Interrupted by user  flushing partial data")
         
         commits_df.to_csv(os.path.join(workingFolder, commits_csv),
-                          sep=cfg.CSV_separator, index=False, lineterminator="\n")
+                        sep=cfg.CSV_separator, index=False, lineterminator="\n")
         prs_df.to_csv(os.path.join(workingFolder, prs_csv),
-                      sep=cfg.CSV_separator, index=False, lineterminator="\n")
+                        sep=cfg.CSV_separator, index=False, lineterminator="\n")
+        prs_reviews_df.to_csv(os.path.join(workingFolder, prs_reviews_csv),
+                        sep=cfg.CSV_separator, index=False, lineterminator="\n")
+        prs_comments_df.to_csv(os.path.join(workingFolder, prs_comments_csv),
+                        sep=cfg.CSV_separator, index=False, lineterminator="\n")
         excluded.to_csv(os.path.join(workingFolder, excl_tmp),
                         sep=cfg.CSV_separator, index=False, lineterminator="\n")
         
@@ -223,11 +266,15 @@ def updateCommitListFile(g, token, repoName, start_date, end_date, workingFolder
     finally:
         pbar.close()
 
-    # ---------- final flush & COMPLETE ----------
     commits_df.to_csv(os.path.join(workingFolder, commits_csv),
-                      sep=cfg.CSV_separator, index=False, lineterminator="\n")
+                    sep=cfg.CSV_separator, index=False, lineterminator="\n")
     prs_df.to_csv(os.path.join(workingFolder, prs_csv),
-                  sep=cfg.CSV_separator, index=False, lineterminator="\n")
+                    sep=cfg.CSV_separator, index=False, lineterminator="\n")
+    prs_reviews_df.to_csv(os.path.join(workingFolder, prs_reviews_csv),
+                    sep=cfg.CSV_separator, index=False, lineterminator="\n")
+    prs_comments_df.to_csv(os.path.join(workingFolder, prs_comments_csv),
+                    sep=cfg.CSV_separator, index=False, lineterminator="\n")
+
     if len(excluded):
         excluded.to_csv(os.path.join(workingFolder, excl_tmp),
                         sep=cfg.CSV_separator, index=False, lineterminator="\n")

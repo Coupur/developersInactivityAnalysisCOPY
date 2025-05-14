@@ -34,6 +34,8 @@ pulls_comments_list_file_name = "pulls_comments_repo.csv"  # The file where the 
 issue_events_list_file_name = "issues_events_repo.csv"  # The file where the repo issue events will be archived
 issue_pr_list_file_name = "issues_prs_repo.csv"  # The file where the repo issue/PRs creations will be archived
 PR_list_file_name= "prs_repo.csv" # The file where the repo PRs will be archived
+prs_comments_csv = "prs_comments.csv"  # The file where the repo PRs comments will be archived
+prs_reviews_csv=  "prs_reviews.csv"  # The file where the repo PRs reviews will be archived
 #core_commit_coverage = 0.8 #Percentage of commits to cover for the core identification
 
 ### Files Settings
